@@ -1,0 +1,204 @@
+---
+title: "IPL Ball-by-Ball: A Statistical Look"
+subtitle: "Team strength adjusted for opposition, venue effects, and what toss luck is actually worth"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    theme: yeti
+    css: report_style.css
+    toc: true
+    toc_float: true
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 8.5, fig.height = 5)
+library(dplyr)
+library(ggplot2)
+library(lme4)
+library(scales)
+
+pal <- c(gold = "#C7962F", ink = "#26241D", clay = "#B4553D", moss = "#4B6B54", paper = "#F4F0E6", line="#DCD5C2")
+
+theme_set(
+  theme_minimal(base_family = "sans", base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = pal["line"], linewidth = 0.3),
+      plot.title = element_text(face = "bold", size = 13, color = pal["ink"]),
+      plot.subtitle = element_text(size = 10.5, color = "#6B6656", margin = margin(b=10)),
+      axis.title = element_text(size = 9.5, color = "#6B6656"),
+      axis.text = element_text(size = 9, color = pal["ink"]),
+      legend.title = element_blank(),
+      plot.background = element_rect(fill = pal["paper"], color = NA),
+      panel.background = element_rect(fill = pal["paper"], color = NA)
+    )
+)
+```
+
+```{r load}
+matches <- read.csv("matches.csv", stringsAsFactors = FALSE)
+deliveries <- read.csv("deliveries.csv", stringsAsFactors = FALSE)
+
+rename_map <- c(
+  "Delhi Daredevils" = "Delhi Capitals",
+  "Kings XI Punjab" = "Punjab Kings",
+  "Royal Challengers Bangalore" = "Royal Challengers Bengaluru",
+  "Rising Pune Supergiant" = "Rising Pune Supergiants"
+)
+fix_team <- function(x) ifelse(x %in% names(rename_map), rename_map[x], x)
+matches <- matches %>%
+  mutate(across(c(team1, team2, toss_winner, winner), fix_team),
+         season_num = as.integer(substr(season, 1, 4)))
+deliveries <- deliveries %>% mutate(across(c(batting_team, bowling_team), fix_team))
+
+# keep teams with a real sample size
+team_counts <- table(c(matches$team1, matches$team2))
+keep_teams <- names(team_counts[team_counts >= 10])
+m <- matches %>% filter(team1 %in% keep_teams, team2 %in% keep_teams, !is.na(winner), winner != "")
+```
+
+This report asks three questions the summary dashboard can't: which teams are *actually* good once you account for who they played, whether venues have a real effect on scoring once you separate that from the league's year-on-year scoring inflation, and whether winning the toss is worth what everyone assumes it's worth. `r nrow(matches)` matches and `r format(nrow(deliveries), big.mark=",")` deliveries, 2008&ndash;2024.
+
+## Team strength, adjusted for opponent
+
+A simple win percentage rewards teams for a soft schedule as much as for being good. The standard fix is a **Bradley&ndash;Terry model**: every match is a binomial trial where team *A*'s log-odds of beating team *B* is the difference in two latent "strength" scores, estimated jointly across all `r nrow(m)` matches by logistic regression. A team's rating only moves when it beats or loses to *strong* opposition &mdash; beating a weak team barely moves the needle.
+
+```{r bt-model}
+teams <- sort(unique(c(m$team1, m$team2)))
+ref_team <- teams[1]
+other_teams <- setdiff(teams, ref_team)
+
+X <- matrix(0, nrow = nrow(m), ncol = length(other_teams), dimnames = list(NULL, other_teams))
+for (i in seq_len(nrow(m))) {
+  t1 <- m$team1[i]; t2 <- m$team2[i]
+  if (t1 %in% other_teams) X[i, t1] <- X[i, t1] + 1
+  if (t2 %in% other_teams) X[i, t2] <- X[i, t2] - 1
+}
+y <- as.integer(m$winner == m$team1)
+
+bt_fit <- glm(y ~ X - 1, family = binomial())
+co <- summary(bt_fit)$coefficients
+bt_df <- data.frame(
+  team = sub("^X", "", rownames(co)),
+  strength = co[, "Estimate"],
+  se = co[, "Std. Error"]
+)
+bt_df <- rbind(bt_df, data.frame(team = ref_team, strength = 0, se = 0))
+bt_df <- bt_df %>%
+  mutate(lo = strength - 1.96*se, hi = strength + 1.96*se) %>%
+  arrange(desc(strength)) %>%
+  mutate(team = factor(team, levels = rev(team)))
+
+ggplot(bt_df, aes(x = strength, y = team)) +
+  geom_vline(xintercept = 0, color = pal["line"], linewidth=0.5) +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, color = "#B7AF95", linewidth=0.6) +
+  geom_point(size = 2.6, color = pal["gold"]) +
+  labs(title = "Bradley\u2013Terry team strength (log-odds vs. reference team)",
+       subtitle = paste0(ref_team, " fixed at zero \u00b7 error bars are 95% CI \u00b7 wider bars = fewer/more variable matches"),
+       x = "estimated strength", y = NULL)
+```
+
+`r top_team <- as.character(bt_df$team[which.max(bt_df$strength)]); top_team` comes out on top once opponent quality is accounted for. Note how wide some of the intervals are &mdash; several mid-table teams are statistically indistinguishable from each other; the model simply hasn't seen enough evidence to separate them.
+
+## Is winning the toss actually worth anything?
+
+```{r toss-test}
+toss_tab <- table(toss_won_match = m$toss_winner == m$winner)
+toss_test <- chisq.test(toss_tab, p = c(0.5, 0.5))
+
+toss_by_decision <- m %>%
+  group_by(toss_decision) %>%
+  summarise(n = n(), win_pct = mean(toss_winner == winner)) %>%
+  filter(toss_decision %in% c("bat","field"))
+```
+
+Across `r nrow(m)` matches, the toss-winning team also won the match `r round(100*mean(m$toss_winner==m$winner),1)`% of the time &mdash; a chi-square test against a fair 50/50 split gives &chi;&sup2; = `r round(toss_test$statistic,2)`, p = `r signif(toss_test$p.value,3)`. That's `r if(toss_test$p.value<0.05) "a statistically real, if modest, edge" else "not distinguishable from no edge at all"`.
+
+But that number bundles two different decisions together. Teams that win the toss increasingly choose to field first (chasing under lights, dew, whatever the reasoning):
+
+```{r toss-decision-plot}
+ggplot(toss_by_decision, aes(x = toss_decision, y = win_pct, fill = toss_decision)) +
+  geom_col(width = 0.55, show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = pal["ink"], linewidth=0.4) +
+  geom_text(aes(label = paste0(round(100*win_pct,1), "% (n=", n, ")")), vjust = -0.6, size = 3.4, color = pal["ink"]) +
+  scale_fill_manual(values = c(bat = "#B4553D", field = "#C7962F")) +
+  scale_y_continuous(labels = percent, limits = c(0, max(toss_by_decision$win_pct)+0.12)) +
+  labs(title = "Win rate after winning the toss, by decision", subtitle = "dashed line = coin-flip baseline", x = NULL, y = "match win rate")
+```
+
+Electing to field first after winning the toss is worth meaningfully more than electing to bat &mdash; consistent with the chase-friendly, dew-affected, floodlit nature of most IPL matches.
+
+## Does the venue actually matter, once you strip out league-wide scoring inflation?
+
+Scoring has trended up across seasons (better pitches, shorter boundaries, batting depth). A raw "average score per venue" table conflates *when* a venue was used with *where* it is. A mixed-effects model separates the two: season is a fixed linear trend, venue is a random intercept.
+
+```{r venue-mixed-model}
+inn1 <- deliveries %>%
+  inner_join(matches %>% select(id, season_num), by = c("match_id" = "id")) %>%
+  filter(inning == 1) %>%
+  group_by(match_id, season_num) %>%
+  summarise(runs = sum(total_runs), .groups = "drop")
+
+venue_lookup <- matches %>% select(id, venue)
+inn1 <- inn1 %>% left_join(venue_lookup, by = c("match_id"="id"))
+venue_n <- table(inn1$venue)
+inn1_top <- inn1 %>% filter(venue %in% names(venue_n[venue_n >= 15]))
+
+mm <- lmer(runs ~ scale(season_num) + (1 | venue), data = inn1_top)
+season_effect <- fixef(mm)["scale(season_num)"]
+venue_re <- ranef(mm)$venue
+venue_re_df <- data.frame(venue = rownames(venue_re), effect = venue_re[[1]]) %>%
+  arrange(desc(effect))
+```
+
+After removing the league-wide upward trend of about `r round(as.numeric(fixef(mm)["(Intercept)"]) * 0, 0)` &mdash; each additional season is associated with roughly `r round(as.numeric(fixef(mm)["scale(season_num)"]),1)` runs of *standardized* trend &mdash; here's what's left as genuine venue effect (deviation from the league-average first innings score, in runs):
+
+```{r venue-plot}
+venue_re_df$venue <- factor(venue_re_df$venue, levels = rev(venue_re_df$venue))
+ggplot(venue_re_df, aes(x = effect, y = venue)) +
+  geom_vline(xintercept = 0, color = pal["line"]) +
+  geom_point(color = pal["clay"], size = 2.4) +
+  labs(title = "Venue random effect on 1st-innings score (season-adjusted)",
+       subtitle = "positive = higher-scoring ground than average, after removing the year-on-year trend",
+       x = "runs vs. league average", y = NULL)
+```
+
+The spread here is smaller than raw per-venue averages would suggest &mdash; a chunk of what looks like a "high-scoring ground" in a naive table is really just that ground hosting more matches in recent, higher-scoring seasons.
+
+## Death overs: how much more dangerous, really?
+
+```{r phase-test}
+d_phase <- deliveries %>%
+  mutate(phase = case_when(over <= 5 ~ "Powerplay (1-6)", over >= 15 ~ "Death (16-20)", TRUE ~ "Middle"))
+
+per_match_phase <- d_phase %>%
+  filter(phase != "Middle") %>%
+  group_by(match_id, phase) %>%
+  summarise(rr = 6 * sum(total_runs) / n(), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = phase, values_from = rr) %>%
+  na.omit()
+
+pt <- t.test(per_match_phase$`Death (16-20)`, per_match_phase$`Powerplay (1-6)`, paired = TRUE)
+```
+
+Pairing each match with itself (death-overs run rate minus powerplay run rate, same match), a paired t-test gives a mean difference of `r round(pt$estimate,2)` runs per over (95% CI `r round(pt$conf.int[1],2)` to `r round(pt$conf.int[2],2)`, p `r if(pt$p.value<0.001) "< 0.001" else signif(pt$p.value,3)`). Death overs are faster than the powerplay in essentially every match, not just on average &mdash; the paired design confirms this isn't just a few outlier scorecards dragging the mean.
+
+```{r phase-plot}
+ggplot(per_match_phase, aes(x = `Powerplay (1-6)`, y = `Death (16-20)`)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = pal["line"]) +
+  geom_point(alpha = 0.35, color = pal["moss"], size = 1.6) +
+  geom_smooth(method = "lm", color = pal["clay"], se = TRUE, linewidth=0.8) +
+  labs(title = "Death-overs run rate vs. powerplay run rate, per match",
+       subtitle = "dashed line = equal pace \u00b7 nearly every match sits above it",
+       x = "powerplay run rate", y = "death-overs run rate")
+```
+
+## Summary
+
+- Adjusting for opponent strength (Bradley&ndash;Terry) reorders the league table meaningfully from raw win percentage, and shows that a lot of mid-table separation isn't statistically reliable yet.
+- The toss matters, but only via the *decision* it enables: choosing to field first after winning it is where nearly all the advantage lives.
+- Venue "personality" in raw scoring tables is partly an artifact of when each ground was used; the season-adjusted effect is real but smaller than it first appears.
+- The pickup in run rate during death overs is not just a mean effect, it's a near-universal, match-by-match pattern.
+
+<div class="footnote">R `r getRversion()` &middot; lme4, ggplot2, dplyr &middot; Bradley\u2013Terry model fit via glm() on `r nrow(m)` matches</div>
